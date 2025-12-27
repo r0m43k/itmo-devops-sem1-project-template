@@ -27,18 +27,22 @@ func main() {
 
 	http.HandleFunc("/api/v0/prices", func(w http.ResponseWriter, r *http.Request) {
 
-		if r.Method == "POST" {
+		if r.Method == http.MethodPost {
 
 			r.ParseMultipartForm(32 << 20)
-			file, _, _ := r.FormFile("file")
-			defer file.Close()
+			f, _, err := r.FormFile("file")
+			if err != nil {
+				http.Error(w, "no file", 400)
+				return
+			}
+			defer f.Close()
 
-			zipBytes, _ := io.ReadAll(file)
+			zipBytes, _ := io.ReadAll(f)
 
 			zr, _ := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
-			zf, _ := zr.File[0].Open()
-			csvBytes, _ := io.ReadAll(zf)
-			zf.Close()
+			rc, _ := zr.File[0].Open()
+			csvBytes, _ := io.ReadAll(rc)
+			rc.Close()
 
 			cr := csv.NewReader(bytes.NewReader(csvBytes))
 			rows, _ := cr.ReadAll()
@@ -54,20 +58,20 @@ func main() {
 				)
 			}
 
-			var totalItems, totalCategories, totalPrice int
+			var items, cats, sum int
 			db.QueryRow(
 				"SELECT COUNT(*), COUNT(DISTINCT category), COALESCE(SUM(price),0) FROM prices",
-			).Scan(&totalItems, &totalCategories, &totalPrice)
+			).Scan(&items, &cats, &sum)
 
 			json.NewEncoder(w).Encode(map[string]int{
-				"total_items":      totalItems,
-				"total_categories": totalCategories,
-				"total_price":      totalPrice,
+				"total_items":      items,
+				"total_categories": cats,
+				"total_price":      sum,
 			})
 			return
 		}
 
-		if r.Method == "GET" {
+		if r.Method == http.MethodGet {
 
 			rows, _ := db.Query("SELECT * FROM prices")
 
@@ -91,6 +95,7 @@ func main() {
 			}
 			cw.Flush()
 
+			w.Header().Set("Content-Type", "application/zip")
 			zw := zip.NewWriter(w)
 			f, _ := zw.Create("data.csv")
 			f.Write(buf.Bytes())
