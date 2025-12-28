@@ -1,14 +1,14 @@
 #!/bin/bash
 set -e
 
+sudo apt-get update -y
+sudo apt-get install -y postgresql-client curl zip unzip tar
+
 DB_HOST="${POSTGRES_HOST:-localhost}"
 DB_PORT="${POSTGRES_PORT:-5432}"
 DB_NAME="${POSTGRES_DB:-project-sem-1}"
 DB_USER="${POSTGRES_USER:-validator}"
 DB_PASSWORD="${POSTGRES_PASSWORD:-val1dat0r}"
-
-sudo apt-get update -y
-sudo apt-get install -y postgresql-client curl zip unzip tar
 
 export PGPASSWORD="$DB_PASSWORD"
 
