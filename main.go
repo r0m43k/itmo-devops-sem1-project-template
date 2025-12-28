@@ -123,7 +123,6 @@ func parseAndInsertCSV(db *sql.DB, csvBytes []byte) (totalCount int, inserted in
 
 	for i := 1; i < len(rows); i++ {
 		totalCount++
-
 		if len(rows[i]) < 5 {
 			continue
 		}
