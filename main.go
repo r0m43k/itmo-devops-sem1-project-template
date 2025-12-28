@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
 	"database/sql"
@@ -29,6 +30,11 @@ func main() {
 
 		if r.Method == http.MethodPost {
 
+			archiveType := r.URL.Query().Get("type")
+			if archiveType == "" {
+				archiveType = "zip"
+			}
+
 			r.ParseMultipartForm(32 << 20)
 			f, _, err := r.FormFile("file")
 			if err != nil {
@@ -37,17 +43,48 @@ func main() {
 			}
 			defer f.Close()
 
-			zipBytes, _ := io.ReadAll(f)
+			data, _ := io.ReadAll(f)
+			var csvData []byte
 
-			zr, _ := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
-			rc, _ := zr.File[0].Open()
-			csvBytes, _ := io.ReadAll(rc)
-			rc.Close()
+			if archiveType == "zip" {
+				zr, _ := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+				rc, _ := zr.File[0].Open()
+				csvData, _ = io.ReadAll(rc)
+				rc.Close()
+			}
 
-			cr := csv.NewReader(bytes.NewReader(csvBytes))
+			if archiveType == "tar" {
+				tr := tar.NewReader(bytes.NewReader(data))
+
+				for {
+					h, err := tr.Next()
+					if err == io.EOF {
+						break
+					}
+					if err != nil {
+						break
+					}
+
+					if h.Typeflag != tar.TypeReg {
+						continue
+					}
+
+					if h.Name == "test_data.csv" || h.Name == "./test_data.csv" || h.Name == "data.csv" || h.Name == "./data.csv" {
+						csvData, _ = io.ReadAll(tr)
+						break
+					}
+				}
+			}
+
+
+			cr := csv.NewReader(bytes.NewReader(csvData))
 			rows, _ := cr.ReadAll()
 
 			for i := 1; i < len(rows); i++ {
+				if len(rows[i]) < 5 {
+					continue
+				}
+
 				id, _ := strconv.Atoi(rows[i][0])
 				price, _ := strconv.Atoi(rows[i][3])
 				date, _ := time.Parse("2006-01-02", rows[i][4])
@@ -58,11 +95,13 @@ func main() {
 				)
 			}
 
+
 			var items, cats, sum int
 			db.QueryRow(
 				"SELECT COUNT(*), COUNT(DISTINCT category), COALESCE(SUM(price),0) FROM prices",
 			).Scan(&items, &cats, &sum)
-
+			
+			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]int{
 				"total_items":      items,
 				"total_categories": cats,
