@@ -1,23 +1,20 @@
 #!/bin/bash
 set -e
 
-APP_PORT=8080
-APP_URL="http://localhost:${APP_PORT}/api/v0/prices"
+APP_PORT="${APP_PORT:-8080}"
 
 go build -o project_sem .
 
-./project_sem > server.log 2>&1 &
-echo $! > server.pid
+pkill project_sem 2>/dev/null || true
+./project_sem > app.log 2>&1 &
 
-for i in $(seq 1 40); do
-  code=$(curl -s -o /dev/null -w "%{http_code}" "$APP_URL" || true)
-  if [[ "$code" == "200" || "$code" == "405" ]]; then
-    echo "Server is up"
+for i in $(seq 1 30); do
+  if curl -s "http://localhost:${APP_PORT}/api/v0/prices" >/dev/null 2>&1; then
     exit 0
   fi
-  sleep 0.25
+  sleep 1
 done
 
-echo "server.log:"
-cat server.log || true
+echo "App did not start. Logs:"
+tail -n 200 app.log || true
 exit 1
