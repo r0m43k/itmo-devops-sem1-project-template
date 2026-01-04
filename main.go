@@ -26,7 +26,6 @@ type PostResponse struct {
 	TotalItems      int     `json:"total_items"`
 	TotalCategories int     `json:"total_categories"`
 	TotalPrice      float64 `json:"total_price"`
-	Inserted        int     `json:"inserted"`
 }
 
 func getenv(k, def string) string {
@@ -82,6 +81,22 @@ CREATE TABLE IF NOT EXISTS prices (
 	}
 }
 
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writePostError(w http.ResponseWriter, code int) {
+	writeJSON(w, code, PostResponse{
+		TotalCount:      0,
+		DuplicatesCount: 0,
+		TotalItems:      0,
+		TotalCategories: 0,
+		TotalPrice:      0,
+	})
+}
+
 func readMultipartFile(r *http.Request) ([]byte, error) {
 	if err := r.ParseMultipartForm(32 << 20); err != nil {
 		return nil, err
@@ -131,7 +146,7 @@ func readCSVFromTar(b []byte) ([]byte, error) {
 }
 
 func parseDate(s string) (time.Time, bool) {
-	t, err := time.Parse("2006-01-02", s)
+	t, err := time.Parse("2006-01-02", strings.TrimSpace(s))
 	if err != nil {
 		return time.Time{}, false
 	}
@@ -139,7 +154,7 @@ func parseDate(s string) (time.Time, bool) {
 }
 
 func parsePrice(s string) (float64, bool) {
-	v, err := strconv.ParseFloat(s, 64)
+	v, err := strconv.ParseFloat(strings.TrimSpace(s), 64)
 	if err != nil {
 		return 0, false
 	}
@@ -156,11 +171,11 @@ type rowData struct {
 	dt   time.Time
 }
 
-func validateCSV(csvBytes []byte) (totalCount int, valid []rowData) {
+func validateCSV(csvBytes []byte) (totalCount int, valid []rowData, ok bool) {
 	cr := csv.NewReader(bytes.NewReader(csvBytes))
 	rows, err := cr.ReadAll()
 	if err != nil || len(rows) <= 1 {
-		return 0, nil
+		return 0, nil, false
 	}
 
 	valid = make([]rowData, 0, len(rows)-1)
@@ -172,7 +187,6 @@ func validateCSV(csvBytes []byte) (totalCount int, valid []rowData) {
 			continue
 		}
 
-		// id из CSV проверяем на int, но в БД НЕ вставляем (id SERIAL)
 		if _, err := strconv.Atoi(strings.TrimSpace(rows[i][0])); err != nil {
 			continue
 		}
@@ -183,12 +197,12 @@ func validateCSV(csvBytes []byte) (totalCount int, valid []rowData) {
 			continue
 		}
 
-		pr, ok := parsePrice(strings.TrimSpace(rows[i][3]))
+		pr, ok := parsePrice(rows[i][3])
 		if !ok {
 			continue
 		}
 
-		dt, ok := parseDate(strings.TrimSpace(rows[i][4]))
+		dt, ok := parseDate(rows[i][4])
 		if !ok {
 			continue
 		}
@@ -196,13 +210,13 @@ func validateCSV(csvBytes []byte) (totalCount int, valid []rowData) {
 		valid = append(valid, rowData{name: name, cat: cat, pr: pr, dt: dt})
 	}
 
-	return totalCount, valid
+	return totalCount, valid, true
 }
 
-func insertValidRowsTx(db *sql.DB, rows []rowData) (inserted int, err error) {
+func insertRowsAndStatsTx(db *sql.DB, rows []rowData) (inserted int, items int, cats int, sum float64, dup int, err error) {
 	tx, err := db.Begin()
 	if err != nil {
-		return 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 	defer func() {
 		if err != nil {
@@ -212,7 +226,7 @@ func insertValidRowsTx(db *sql.DB, rows []rowData) (inserted int, err error) {
 
 	stmt, err := tx.Prepare(`INSERT INTO prices (name, category, price, create_date) VALUES ($1,$2,$3,$4)`)
 	if err != nil {
-		return 0, err
+		return 0, 0, 0, 0, 0, err
 	}
 	defer stmt.Close()
 
@@ -220,35 +234,32 @@ func insertValidRowsTx(db *sql.DB, rows []rowData) (inserted int, err error) {
 		_, e := stmt.Exec(r.name, r.cat, r.pr, r.dt)
 		if e != nil {
 			err = e
-			return 0, err
+			return 0, 0, 0, 0, 0, err
 		}
 		inserted++
 	}
 
-	if err = tx.Commit(); err != nil {
-		return 0, err
+	err = tx.QueryRow(`SELECT COUNT(*), COUNT(DISTINCT category), COALESCE(SUM(price),0) FROM prices`).Scan(&items, &cats, &sum)
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
 	}
-	return inserted, nil
-}
 
-func statsAll(db *sql.DB) (items, cats int, sum float64, err error) {
-	err = db.QueryRow(
-		`SELECT COUNT(*), COUNT(DISTINCT category), COALESCE(SUM(price),0) FROM prices`,
-	).Scan(&items, &cats, &sum)
-	return
-}
-
-func duplicatesAll(db *sql.DB) (int, error) {
-	var d int
-	err := db.QueryRow(`
-SELECT COALESCE(COUNT(*),0) FROM (
-  SELECT name, category, price, create_date, COUNT(*) c
+	err = tx.QueryRow(`
+SELECT COALESCE(SUM(c - 1), 0) FROM (
+  SELECT COUNT(*) c
   FROM prices
   GROUP BY name, category, price, create_date
   HAVING COUNT(*) > 1
 ) t;
-`).Scan(&d)
-	return d, err
+`).Scan(&dup)
+	if err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+
+	if err = tx.Commit(); err != nil {
+		return 0, 0, 0, 0, 0, err
+	}
+	return inserted, items, cats, sum, dup, nil
 }
 
 func handlePOST(db *sql.DB, w http.ResponseWriter, r *http.Request) {
@@ -259,7 +270,7 @@ func handlePOST(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 
 	fileBytes, err := readMultipartFile(r)
 	if err != nil {
-		http.Error(w, "no file", http.StatusBadRequest)
+		writePostError(w, http.StatusBadRequest)
 		return
 	}
 
@@ -270,47 +281,37 @@ func handlePOST(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	case "tar":
 		csvBytes, err = readCSVFromTar(fileBytes)
 	default:
-		http.Error(w, "bad type", http.StatusBadRequest)
+		writePostError(w, http.StatusBadRequest)
 		return
 	}
 
 	if err != nil {
-		http.Error(w, "bad archive", http.StatusBadRequest)
+		writePostError(w, http.StatusBadRequest)
 		return
 	}
 	if len(csvBytes) == 0 {
-		http.Error(w, "empty csv", http.StatusBadRequest)
+		writePostError(w, http.StatusBadRequest)
 		return
 	}
 
-	totalCount, validRows := validateCSV(csvBytes)
+	totalCount, validRows, ok := validateCSV(csvBytes)
+	if !ok {
+		writePostError(w, http.StatusBadRequest)
+		return
+	}
 
-	inserted, err := insertValidRowsTx(db, validRows)
+	inserted, _, cats, sum, dup, err := insertRowsAndStatsTx(db, validRows)
 	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
+		writePostError(w, http.StatusInternalServerError)
 		return
 	}
 
-	items, cats, sum, err := statsAll(db)
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-
-	dup, err := duplicatesAll(db)
-	if err != nil {
-		http.Error(w, "db error", http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(PostResponse{
+	writeJSON(w, http.StatusOK, PostResponse{
 		TotalCount:      totalCount,
 		DuplicatesCount: dup,
-		TotalItems:      items,
+		TotalItems:      inserted,
 		TotalCategories: cats,
 		TotalPrice:      sum,
-		Inserted:        inserted,
 	})
 }
 
@@ -325,33 +326,45 @@ func handleGET(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	argN := 1
 
 	if startStr != "" {
-		if t, ok := parseDate(startStr); ok {
-			where = append(where, "create_date >= $"+strconv.Itoa(argN))
-			args = append(args, t)
-			argN++
+		t, ok := parseDate(startStr)
+		if !ok {
+			http.Error(w, "bad start", http.StatusBadRequest)
+			return
 		}
+		where = append(where, "create_date >= $"+strconv.Itoa(argN))
+		args = append(args, t)
+		argN++
 	}
 	if endStr != "" {
-		if t, ok := parseDate(endStr); ok {
-			t = t.Add(24*time.Hour - time.Nanosecond)
-			where = append(where, "create_date <= $"+strconv.Itoa(argN))
-			args = append(args, t)
-			argN++
+		t, ok := parseDate(endStr)
+		if !ok {
+			http.Error(w, "bad end", http.StatusBadRequest)
+			return
 		}
+		t = t.Add(24*time.Hour - time.Nanosecond)
+		where = append(where, "create_date <= $"+strconv.Itoa(argN))
+		args = append(args, t)
+		argN++
 	}
 	if minStr != "" {
-		if v, err := strconv.ParseFloat(minStr, 64); err == nil {
-			where = append(where, "price >= $"+strconv.Itoa(argN))
-			args = append(args, v)
-			argN++
+		v, err := strconv.ParseFloat(minStr, 64)
+		if err != nil {
+			http.Error(w, "bad min", http.StatusBadRequest)
+			return
 		}
+		where = append(where, "price >= $"+strconv.Itoa(argN))
+		args = append(args, v)
+		argN++
 	}
 	if maxStr != "" {
-		if v, err := strconv.ParseFloat(maxStr, 64); err == nil {
-			where = append(where, "price <= $"+strconv.Itoa(argN))
-			args = append(args, v)
-			argN++
+		v, err := strconv.ParseFloat(maxStr, 64)
+		if err != nil {
+			http.Error(w, "bad max", http.StatusBadRequest)
+			return
 		}
+		where = append(where, "price <= $"+strconv.Itoa(argN))
+		args = append(args, v)
+		argN++
 	}
 
 	q := "SELECT id, name, category, price, create_date FROM prices"
@@ -379,7 +392,8 @@ func handleGET(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var rr outRow
 		if err := rows.Scan(&rr.id, &rr.name, &rr.cat, &rr.pr, &rr.dt); err != nil {
-			continue
+			http.Error(w, "db error", http.StatusInternalServerError)
+			return
 		}
 		out = append(out, rr)
 	}
@@ -392,7 +406,7 @@ func handleGET(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 	cw := csv.NewWriter(&buf)
 	_ = cw.Write([]string{"id", "name", "category", "price", "create_date"})
 	for _, rr := range out {
-		priceStr := strconv.FormatFloat(rr.pr, 'f', -1, 64)
+		priceStr := strconv.FormatFloat(rr.pr, 'f', 2, 64)
 		_ = cw.Write([]string{
 			strconv.Itoa(rr.id),
 			rr.name,
@@ -409,7 +423,7 @@ func handleGET(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/zip")
 	zw := zip.NewWriter(w)
-	defer zw.Close()
+	defer func() { _ = zw.Close() }()
 
 	f, err := zw.Create("data.csv")
 	if err != nil {
