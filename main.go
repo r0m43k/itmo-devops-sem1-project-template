@@ -28,6 +28,13 @@ type PostResponse struct {
 	TotalPrice      float64 `json:"total_price"`
 }
 
+type insertResult struct {
+	Inserted        int
+	Duplicates      int
+	TotalCategories int
+	TotalPrice      float64
+}
+
 func getenv(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
@@ -75,6 +82,14 @@ CREATE TABLE IF NOT EXISTS prices (
   price DECIMAL(10,2) NOT NULL,
   create_date TIMESTAMP NOT NULL
 );
+`)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	_, err = db.Exec(`
+CREATE UNIQUE INDEX IF NOT EXISTS prices_uniq
+ON prices (name, category, price, create_date);
 `)
 	if err != nil {
 		log.Fatal(err)
@@ -213,10 +228,12 @@ func validateCSV(csvBytes []byte) (totalCount int, valid []rowData, ok bool) {
 	return totalCount, valid, true
 }
 
-func insertRowsAndStatsTx(db *sql.DB, rows []rowData) (inserted int, items int, cats int, sum float64, dup int, err error) {
+func insertRowsAndStatsTx(db *sql.DB, rows []rowData) (insertResult, error) {
+	var res insertResult
+
 	tx, err := db.Begin()
 	if err != nil {
-		return 0, 0, 0, 0, 0, err
+		return res, err
 	}
 	defer func() {
 		if err != nil {
@@ -224,42 +241,43 @@ func insertRowsAndStatsTx(db *sql.DB, rows []rowData) (inserted int, items int, 
 		}
 	}()
 
-	stmt, err := tx.Prepare(`INSERT INTO prices (name, category, price, create_date) VALUES ($1,$2,$3,$4)`)
+	stmt, err := tx.Prepare(`
+INSERT INTO prices (name, category, price, create_date)
+VALUES ($1,$2,$3,$4)
+ON CONFLICT DO NOTHING
+`)
 	if err != nil {
-		return 0, 0, 0, 0, 0, err
+		return res, err
 	}
 	defer stmt.Close()
 
 	for _, r := range rows {
-		_, e := stmt.Exec(r.name, r.cat, r.pr, r.dt)
+		rr, e := stmt.Exec(r.name, r.cat, r.pr, r.dt)
 		if e != nil {
 			err = e
-			return 0, 0, 0, 0, 0, err
+			return insertResult{}, err
 		}
-		inserted++
+		aff, e := rr.RowsAffected()
+		if e != nil {
+			err = e
+			return insertResult{}, err
+		}
+		if aff == 1 {
+			res.Inserted++
+		}
 	}
 
-	err = tx.QueryRow(`SELECT COUNT(*), COUNT(DISTINCT category), COALESCE(SUM(price),0) FROM prices`).Scan(&items, &cats, &sum)
-	if err != nil {
-		return 0, 0, 0, 0, 0, err
-	}
+	res.Duplicates = len(rows) - res.Inserted
 
-	err = tx.QueryRow(`
-SELECT COALESCE(SUM(c - 1), 0) FROM (
-  SELECT COUNT(*) c
-  FROM prices
-  GROUP BY name, category, price, create_date
-  HAVING COUNT(*) > 1
-) t;
-`).Scan(&dup)
+	err = tx.QueryRow(`SELECT COUNT(DISTINCT category), COALESCE(SUM(price),0) FROM prices`).Scan(&res.TotalCategories, &res.TotalPrice)
 	if err != nil {
-		return 0, 0, 0, 0, 0, err
+		return insertResult{}, err
 	}
 
 	if err = tx.Commit(); err != nil {
-		return 0, 0, 0, 0, 0, err
+		return insertResult{}, err
 	}
-	return inserted, items, cats, sum, dup, nil
+	return res, nil
 }
 
 func handlePOST(db *sql.DB, w http.ResponseWriter, r *http.Request) {
@@ -285,11 +303,7 @@ func handlePOST(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err != nil {
-		writePostError(w, http.StatusBadRequest)
-		return
-	}
-	if len(csvBytes) == 0 {
+	if err != nil || len(csvBytes) == 0 {
 		writePostError(w, http.StatusBadRequest)
 		return
 	}
@@ -300,7 +314,7 @@ func handlePOST(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	inserted, _, cats, sum, dup, err := insertRowsAndStatsTx(db, validRows)
+	ins, err := insertRowsAndStatsTx(db, validRows)
 	if err != nil {
 		writePostError(w, http.StatusInternalServerError)
 		return
@@ -308,10 +322,10 @@ func handlePOST(db *sql.DB, w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusOK, PostResponse{
 		TotalCount:      totalCount,
-		DuplicatesCount: dup,
-		TotalItems:      inserted,
-		TotalCategories: cats,
-		TotalPrice:      sum,
+		DuplicatesCount: ins.Duplicates,
+		TotalItems:      ins.Inserted,
+		TotalCategories: ins.TotalCategories,
+		TotalPrice:      ins.TotalPrice,
 	})
 }
 
